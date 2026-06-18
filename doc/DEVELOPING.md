@@ -228,6 +228,31 @@ If the `codex` CLI is not installed or not on `PATH`, `codex_local` agent runs f
 
 Local adapters require their corresponding CLI/session setup on the machine running Paperclip. External adapters are installed through the adapter/plugin flow and should not require hardcoded imports in `server/` or `ui/`.
 
+## Per-Run Workspace Garbage Collection
+
+Managed runtimes (SSH / sandbox execution targets) copy the canonical workspace into a throwaway per-run directory at:
+
+- `<baseCwd>/.paperclip-runtime/runs/<runId>/workspace`
+
+Once a run finishes, the restore step merges file changes back to the canonical workspace, so the per-run copy is pure waste. Paperclip cleans these up automatically:
+
+- **On completion** — after a run's workspace is restored, its `runs/<runId>` directory is removed.
+- **On preparation** — before a new run starts, a best-effort sweep reaps stale sibling `runs/*` directories. Runs with a live process (tracked in the in-memory registry) are always spared regardless of age, so an old mtime can never reap active work.
+
+Both behaviors are best-effort: a failed delete is logged and retried by the next prepare-time sweep rather than failing the run.
+
+Tunable via environment variables (read by `resolveRunWorkspaceGcConfig`):
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PAPERCLIP_KEEP_RUN_WORKSPACE` | unset | Truthy → keep every per-run workspace (debug opt-out) and disable the sweep. |
+| `PAPERCLIP_RUN_WORKSPACE_RETENTION_HOURS` | `24` | TTL; sibling run dirs older than this are eligible for the sweep. |
+| `PAPERCLIP_RUN_WORKSPACE_MAX_COUNT` | unset | Keep at most N terminal run dirs (newest kept). Enforced by the local sweep helper. |
+| `PAPERCLIP_RUN_WORKSPACE_MAX_TOTAL_MB` | unset | Total byte budget across terminal run dirs. Enforced by the local sweep helper. |
+| `PAPERCLIP_RUN_WORKSPACE_SWEEP_DISABLED` | unset | Truthy → skip the prepare-time sweep but still clean on completion. |
+
+> The remote (SSH) prepare-time sweep is TTL-based. The `MAX_COUNT` / `MAX_TOTAL_MB` budgets are applied by `sweepLocalRunWorkspaces` (used for host-local runs directories). Surfacing these knobs through the typed config schema (a `runtimeWorkspace` section mirroring `database.backup`) is tracked as follow-up.
+
 ## Worktree-local Instances
 
 When developing from multiple git worktrees, do not point two Paperclip servers at the same embedded PostgreSQL data directory.

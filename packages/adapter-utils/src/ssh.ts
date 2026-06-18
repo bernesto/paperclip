@@ -799,6 +799,93 @@ async function removeDeletedPathsOnSsh(input: {
   });
 }
 
+const RUN_WORKSPACE_TREE_MARKER = "/.paperclip-runtime/runs";
+
+function normalizePosixPathSlashes(value: string): string {
+  return value.replace(/\\/g, "/");
+}
+
+/**
+ * Guard against catastrophic removals. Only paths that live inside a
+ * `.paperclip-runtime/runs` tree (the runs root itself, or a per-run child)
+ * are eligible for the GC helpers below.
+ */
+export function assertRunWorkspaceTreePath(target: string): void {
+  const normalized = normalizePosixPathSlashes(target).replace(/\/+$/g, "");
+  const isRoot = normalized.endsWith(RUN_WORKSPACE_TREE_MARKER);
+  const isChild = normalized.includes(`${RUN_WORKSPACE_TREE_MARKER}/`);
+  if (!normalized || (!isRoot && !isChild)) {
+    throw new Error(
+      `Refusing to operate on a path outside a .paperclip-runtime/runs tree: ${target}`,
+    );
+  }
+}
+
+/** Build the remote shell command that removes a single per-run workspace directory. */
+export function buildRemoveRunWorkspaceScript(runWorkspaceDir: string): string {
+  return `rm -rf -- ${shellQuote(runWorkspaceDir)}`;
+}
+
+/**
+ * Build the remote shell command that reaps stale per-run workspace
+ * directories under `runsRootDir`. Directories named in `spareRunIds` (live
+ * runs from the in-memory registry, plus the run being prepared) are never
+ * touched; remaining directories older than the retention window are removed.
+ */
+export function buildReapStaleRunWorkspacesScript(input: {
+  runsRootDir: string;
+  retentionMinutes: number;
+  spareRunIds: string[];
+}): string {
+  const minutes = Math.max(0, Math.floor(input.retentionMinutes));
+  const spare = input.spareRunIds
+    .filter((id) => id.trim().length > 0)
+    .map((id) => `! -name ${shellQuote(id)}`)
+    .join(" ");
+  const findExpr = [
+    `find ${shellQuote(input.runsRootDir)} -mindepth 1 -maxdepth 1 -type d`,
+    spare,
+    `-mmin +${minutes}`,
+    "-exec rm -rf -- {} +",
+  ]
+    .filter((part) => part.length > 0)
+    .join(" ");
+  return `if [ -d ${shellQuote(input.runsRootDir)} ]; then ${findExpr}; fi`;
+}
+
+/** Remove a single per-run workspace directory on the remote host. */
+export async function removeRemoteRunWorkspace(
+  spec: SshConnectionConfig,
+  runWorkspaceDir: string,
+  options: { timeoutMs?: number } = {},
+): Promise<void> {
+  assertRunWorkspaceTreePath(runWorkspaceDir);
+  await runSshScript(spec, buildRemoveRunWorkspaceScript(runWorkspaceDir), {
+    timeoutMs: options.timeoutMs ?? 30_000,
+    maxBuffer: 256 * 1024,
+  });
+}
+
+/** Reap stale per-run workspace directories under the remote runs root. */
+export async function reapStaleRemoteRunWorkspaces(input: {
+  spec: SshConnectionConfig;
+  runsRootDir: string;
+  retentionMs: number;
+  spareRunIds: string[];
+  timeoutMs?: number;
+}): Promise<void> {
+  assertRunWorkspaceTreePath(input.runsRootDir);
+  await runSshScript(
+    input.spec,
+    buildReapStaleRunWorkspacesScript({
+      runsRootDir: input.runsRootDir,
+      retentionMinutes: input.retentionMs / 60_000,
+      spareRunIds: input.spareRunIds,
+    }),
+    { timeoutMs: input.timeoutMs ?? 30_000, maxBuffer: 256 * 1024 },
+  );
+}
+
 async function allocateLoopbackPort(host: string): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
     const server = net.createServer();
